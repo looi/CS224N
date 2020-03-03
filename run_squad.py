@@ -440,6 +440,44 @@ def evaluate(args, model, tokenizer, prefix=""):
     return results
 
 
+# Quantize the numpy array to have "levels" levels
+def linear_quantize(arr, levels):
+    minv = arr.min()
+    maxv = arr.max()
+    #print('minv=', minv, 'maxv=', maxv)
+    arr -= minv
+    arr /= (maxv-minv)
+    arr *= levels-1
+    arr = np.around(arr)
+    arr /= levels-1
+    arr *= (maxv-minv)
+    arr += minv
+    return arr
+
+
+# Quantize all model parameters.
+def quantize_model(model, levels):
+    for param in model.parameters():
+        param.requires_grad = False
+        param_copy = param.numpy()
+        param_copy = linear_quantize(param_copy, levels)
+        param[:] = torch.Tensor(param_copy)
+
+
+# Cast all nn.Linear layers to the specified type, and then back to original
+def cast_all_module_linear(model, typeclass):
+    for child_name, child in model.named_children():
+        if isinstance(child, torch.nn.Linear):
+            # Use this to replace the entire module
+            #setattr(model, child_name, nn.Softplus())
+            orig_type = child.weight.data.dtype
+            # Convert to float16 and then back
+            child.weight.data = child.weight.data.type(typeclass).type(orig_type)
+            child.bias.data = child.bias.data.type(typeclass).type(orig_type)
+        else:
+            cast_all_module_linear(child, typeclass)
+
+
 def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False):
     if args.local_rank not in [-1, 0] and not evaluate:
         # Make sure only the first process in distributed training process the dataset, and the others will use the cache
@@ -698,6 +736,8 @@ def main(argv=None):
     parser.add_argument("--server_port", type=str, default="", help="Can be used for distant debugging.")
 
     parser.add_argument("--threads", type=int, default=1, help="multiple threads for converting example to features")
+    parser.add_argument("--cast_model_type", type=str, default="", help="cast all weights in the model to this type")
+    parser.add_argument("--quantize_levels", type=int, default=0, help="quantize model params to this many levels")
     args = parser.parse_args(argv)
 
     if args.doc_stride >= args.max_seq_length - args.max_query_length:
@@ -849,6 +889,16 @@ def main(argv=None):
             # Reload the model
             global_step = checkpoint.split("-")[-1] if len(checkpoints) > 1 else ""
             model = model_class.from_pretrained(checkpoint)  # , force_download=True)
+
+            if args.cast_model_type:
+                typeclass = getattr(torch, args.cast_model_type)
+                logger.info("Casting model to %s", typeclass)
+                cast_all_module_linear(model, typeclass)
+
+            if args.quantize_levels:
+                logger.info("Quantizing model to %s levels", args.quantize_levels)
+                quantize_model(model, args.quantize_levels)
+
             model.to(args.device)
 
             # Evaluate
