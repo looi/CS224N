@@ -26,6 +26,8 @@ import timeit
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm, trange
@@ -104,7 +106,7 @@ def to_list(tensor):
     return tensor.detach().cpu().tolist()
 
 
-def train(args, train_dataset, model, tokenizer):
+def train(args, train_dataset, model, tokenizer, teacher):
     """ Train the model """
     if args.local_rank in [-1, 0]:
         tb_writer = SummaryWriter()
@@ -210,6 +212,8 @@ def train(args, train_dataset, model, tokenizer):
                 continue
 
             model.train()
+            if teacher is not None:
+                teacher.train()
             batch = tuple(t.to(args.device) for t in batch)
 
             inputs = {
@@ -234,7 +238,33 @@ def train(args, train_dataset, model, tokenizer):
 
             outputs = model(**inputs)
             # model outputs are always tuple in transformers (see doc)
-            loss = outputs[0]
+            loss, start_logits_stu, end_logits_stu = outputs
+
+            # Distillation loss
+            if teacher is not None:
+                if "token_type_ids" not in inputs:
+                    inputs["token_type_ids"] = None if args.teacher_type == "xlm" else batch[2]
+                with torch.no_grad():
+                    start_logits_tea, end_logits_tea = teacher(
+                        input_ids=inputs["input_ids"],
+                        token_type_ids=inputs["token_type_ids"],
+                        attention_mask=inputs["attention_mask"],
+                    )
+                assert start_logits_tea.size() == start_logits_stu.size()
+                assert end_logits_tea.size() == end_logits_stu.size()
+
+                loss_fct = nn.KLDivLoss(reduction="batchmean")
+                loss_start = loss_fct(
+                    F.log_softmax(start_logits_stu / args.temperature, dim=-1),
+                    F.softmax(start_logits_tea / args.temperature, dim=-1),
+                ) * (args.temperature ** 2)
+                loss_end = loss_fct(
+                    F.log_softmax(end_logits_stu / args.temperature, dim=-1),
+                    F.softmax(end_logits_tea / args.temperature, dim=-1),
+                ) * (args.temperature ** 2)
+                loss_ce = (loss_start + loss_end) / 2.0
+
+                loss = args.alpha_ce * loss_ce + args.alpha_squad * loss
 
             if args.n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel (not distributed) training
@@ -574,6 +604,29 @@ def main(argv=None):
         help="The output directory where the model checkpoints and predictions will be written.",
     )
 
+    # Distillation parameters (optional)
+    parser.add_argument(
+        "--teacher_type",
+        default=None,
+        type=str,
+        help="Teacher type. Teacher tokenizer and student (model) tokenizer must output the same tokenization. Only for distillation.",
+    )
+    parser.add_argument(
+        "--teacher_name_or_path",
+        default=None,
+        type=str,
+        help="Path to the already SQuAD fine-tuned teacher model. Only for distillation.",
+    )
+    parser.add_argument(
+        "--alpha_ce", default=0.5, type=float, help="Distillation loss linear weight. Only for distillation."
+    )
+    parser.add_argument(
+        "--alpha_squad", default=0.5, type=float, help="True SQuAD loss linear weight. Only for distillation."
+    )
+    parser.add_argument(
+        "--temperature", default=2.0, type=float, help="Distillation temperature. Only for distillation."
+    )
+
     # Other parameters
     parser.add_argument(
         "--data_dir",
@@ -736,6 +789,7 @@ def main(argv=None):
     parser.add_argument("--server_port", type=str, default="", help="Can be used for distant debugging.")
 
     parser.add_argument("--threads", type=int, default=1, help="multiple threads for converting example to features")
+    parser.add_argument("--logging_filename", type=str, default=None, help="filename for logging")
     parser.add_argument("--cast_model_type", type=str, default="", help="cast all weights in the model to this type")
     parser.add_argument("--quantize_levels", type=int, default=0, help="quantize model params to this many levels")
     args = parser.parse_args(argv)
@@ -781,6 +835,7 @@ def main(argv=None):
 
     # Setup logging
     logging.basicConfig(
+        filename=args.logging_filename,
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN,
@@ -820,6 +875,23 @@ def main(argv=None):
         cache_dir=args.cache_dir if args.cache_dir else None,
     )
 
+
+    if args.teacher_type is not None:
+        assert args.teacher_name_or_path is not None
+        assert args.alpha_ce > 0.0
+        assert args.alpha_ce + args.alpha_squad > 0.0
+        assert args.teacher_type != "distilbert", "We constraint teachers not to be of type DistilBERT."
+        teacher_config_class, teacher_model_class, _ = MODEL_CLASSES[args.teacher_type]
+        teacher_config = teacher_config_class.from_pretrained(
+            args.teacher_name_or_path, cache_dir=args.cache_dir if args.cache_dir else None
+        )
+        teacher = teacher_model_class.from_pretrained(
+            args.teacher_name_or_path, config=teacher_config, cache_dir=args.cache_dir if args.cache_dir else None
+        )
+        teacher.to(args.device)
+    else:
+        teacher = None
+
     if args.local_rank == 0:
         # Make sure only the first process in distributed training will download model & vocab
         torch.distributed.barrier()
@@ -842,7 +914,7 @@ def main(argv=None):
     # Training
     if args.do_train:
         train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False)
-        global_step, tr_loss = train(args, train_dataset, model, tokenizer)
+        global_step, tr_loss = train(args, train_dataset, model, tokenizer, teacher)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
     # Save the trained model and the tokenizer
