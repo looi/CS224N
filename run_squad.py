@@ -286,6 +286,10 @@ def train(args, train_dataset, model, tokenizer, teacher):
 
                 optimizer.step()
                 scheduler.step()  # Update learning rate schedule
+
+                if args.quantize_after_every_batch_in_training:
+                    quantize_model(model, args.quantize_levels)
+
                 model.zero_grad()
                 global_step += 1
 
@@ -470,7 +474,7 @@ def evaluate(args, model, tokenizer, prefix=""):
     return results
 
 
-# Quantize the numpy array to have "levels" levels
+# Quantize the tensor to have "levels" levels
 def linear_quantize(arr, levels):
     minv = arr.min()
     maxv = arr.max()
@@ -478,7 +482,7 @@ def linear_quantize(arr, levels):
     arr -= minv
     arr /= (maxv-minv)
     arr *= levels-1
-    arr = np.around(arr)
+    arr.round_()
     arr /= levels-1
     arr *= (maxv-minv)
     arr += minv
@@ -487,12 +491,46 @@ def linear_quantize(arr, levels):
 
 # Quantize all model parameters.
 def quantize_model(model, levels):
-    for param in model.parameters():
-        param.requires_grad = False
-        param_copy = param.numpy()
-        param_copy = linear_quantize(param_copy, levels)
-        param[:] = torch.Tensor(param_copy)
+    with torch.no_grad():
+        for param in model.parameters():
+            linear_quantize(param, levels)
 
+
+def get_iterator_sz(x):
+    sz = 0
+    for i in x:
+        sz += 1
+    return sz
+
+
+# Replace one bert layer with another.
+def replace_bert_layer(model, replace_layer_from, replace_layer_to):
+    bert_encoder = (model.bert.encoder
+        if isinstance(model, BertForQuestionAnswering)
+        else model.distilbert.transformer)
+    print('Encoder has %d layers %d parameters' % (
+        len(bert_encoder.layer), get_iterator_sz(model.parameters())))
+    bert_encoder.layer[replace_layer_to] = bert_encoder.layer[replace_layer_from]
+    print('After replacement, encoder has %d layers %d parameters' % (
+        len(bert_encoder.layer), get_iterator_sz(model.parameters())))
+
+
+# Replace consecutive bert layers by the same layer.
+def replace_alternate_bert_layers(model, direction):
+    if direction not in ['up', 'down']:
+        raise ValueError('Invalid direction for replace_alternate_bert_layers')
+    bert_encoder = (model.bert.encoder
+        if isinstance(model, BertForQuestionAnswering)
+        else model.distilbert.transformer)
+    print('Encoder has %d layers %d parameters' % (
+        len(bert_encoder.layer), get_iterator_sz(model.parameters())))
+    for i in range(1, len(bert_encoder.layer), 2):
+        if direction == 'down':
+            bert_encoder.layer[i-1] = bert_encoder.layer[i]
+        else:
+            bert_encoder.layer[i] = bert_encoder.layer[i-1]
+    print('After replacement, encoder has %d layers %d parameters' % (
+        len(bert_encoder.layer), get_iterator_sz(model.parameters())))
 
 # Cast all nn.Linear layers to the specified type, and then back to original
 def cast_all_module_linear(model, typeclass):
@@ -792,6 +830,11 @@ def main(argv=None):
     parser.add_argument("--logging_filename", type=str, default=None, help="filename for logging")
     parser.add_argument("--cast_model_type", type=str, default="", help="cast all weights in the model to this type")
     parser.add_argument("--quantize_levels", type=int, default=0, help="quantize model params to this many levels")
+    parser.add_argument("--quantize_after_every_batch_in_training", action="store_true", help="quantize model after every batch in training")
+    parser.add_argument("--replace_layer_from", type=int, default=-1, help="replace BERT layer from")
+    parser.add_argument("--replace_layer_to", type=int, default=-1, help="replace BERT layer to")
+    parser.add_argument("--replace_alternate_layers", type=str, default="", help="replace alternate BERT layers (up or down)")
+    parser.add_argument("--vocab_override", type=str, default="", help="override vocab.txt with this file")
     args = parser.parse_args(argv)
 
     if args.doc_stride >= args.max_seq_length - args.max_query_length:
@@ -863,17 +906,28 @@ def main(argv=None):
         args.config_name if args.config_name else args.model_name_or_path,
         cache_dir=args.cache_dir if args.cache_dir else None,
     )
-    tokenizer = tokenizer_class.from_pretrained(
-        args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
-        do_lower_case=args.do_lower_case,
-        cache_dir=args.cache_dir if args.cache_dir else None,
-    )
+    if args.vocab_override:
+        tokenizer = tokenizer_class(
+            args.vocab_override,
+            do_lower_case=args.do_lower_case,
+            cache_dir=args.cache_dir if args.cache_dir else None,
+        )
+    else:
+        tokenizer = tokenizer_class.from_pretrained(
+            args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
+            do_lower_case=args.do_lower_case,
+            cache_dir=args.cache_dir if args.cache_dir else None,
+        )
     model = model_class.from_pretrained(
         args.model_name_or_path,
         from_tf=bool(".ckpt" in args.model_name_or_path),
         config=config,
         cache_dir=args.cache_dir if args.cache_dir else None,
     )
+    if args.replace_layer_from != -1:
+        replace_bert_layer(model, args.replace_layer_from, args.replace_layer_to)
+    if args.replace_alternate_layers:
+        replace_alternate_bert_layers(model, args.replace_alternate_layers)
 
 
     if args.teacher_type is not None:
@@ -970,6 +1024,11 @@ def main(argv=None):
             if args.quantize_levels:
                 logger.info("Quantizing model to %s levels", args.quantize_levels)
                 quantize_model(model, args.quantize_levels)
+
+            if args.replace_layer_from != -1:
+                replace_bert_layer(model, args.replace_layer_from, args.replace_layer_to)
+            if args.replace_alternate_layers:
+                replace_alternate_bert_layers(model, args.replace_alternate_layers)
 
             model.to(args.device)
 
