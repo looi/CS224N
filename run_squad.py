@@ -511,6 +511,8 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
 
 
 def main(argv=None):
+    print(argv)
+    assert False
     parser = argparse.ArgumentParser()
 
     # Required parameters
