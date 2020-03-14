@@ -26,6 +26,8 @@ import timeit
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm, trange
@@ -104,7 +106,7 @@ def to_list(tensor):
     return tensor.detach().cpu().tolist()
 
 
-def train(args, train_dataset, model, tokenizer):
+def train(args, train_dataset, model, tokenizer, teacher):
     """ Train the model """
     if args.local_rank in [-1, 0]:
         tb_writer = SummaryWriter()
@@ -210,6 +212,8 @@ def train(args, train_dataset, model, tokenizer):
                 continue
 
             model.train()
+            if teacher is not None:
+                teacher.train()
             batch = tuple(t.to(args.device) for t in batch)
 
             inputs = {
@@ -234,7 +238,33 @@ def train(args, train_dataset, model, tokenizer):
 
             outputs = model(**inputs)
             # model outputs are always tuple in transformers (see doc)
-            loss = outputs[0]
+            loss, start_logits_stu, end_logits_stu = outputs
+
+            # Distillation loss
+            if teacher is not None:
+                if "token_type_ids" not in inputs:
+                    inputs["token_type_ids"] = None if args.teacher_type == "xlm" else batch[2]
+                with torch.no_grad():
+                    start_logits_tea, end_logits_tea = teacher(
+                        input_ids=inputs["input_ids"],
+                        token_type_ids=inputs["token_type_ids"],
+                        attention_mask=inputs["attention_mask"],
+                    )
+                assert start_logits_tea.size() == start_logits_stu.size()
+                assert end_logits_tea.size() == end_logits_stu.size()
+
+                loss_fct = nn.KLDivLoss(reduction="batchmean")
+                loss_start = loss_fct(
+                    F.log_softmax(start_logits_stu / args.temperature, dim=-1),
+                    F.softmax(start_logits_tea / args.temperature, dim=-1),
+                ) * (args.temperature ** 2)
+                loss_end = loss_fct(
+                    F.log_softmax(end_logits_stu / args.temperature, dim=-1),
+                    F.softmax(end_logits_tea / args.temperature, dim=-1),
+                ) * (args.temperature ** 2)
+                loss_ce = (loss_start + loss_end) / 2.0
+
+                loss = args.alpha_ce * loss_ce + args.alpha_squad * loss
 
             if args.n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel (not distributed) training
@@ -256,6 +286,10 @@ def train(args, train_dataset, model, tokenizer):
 
                 optimizer.step()
                 scheduler.step()  # Update learning rate schedule
+
+                if args.quantize_after_every_batch_in_training:
+                    quantize_model(model, args.quantize_levels)
+
                 model.zero_grad()
                 global_step += 1
 
@@ -440,6 +474,78 @@ def evaluate(args, model, tokenizer, prefix=""):
     return results
 
 
+# Quantize the tensor to have "levels" levels
+def linear_quantize(arr, levels):
+    minv = arr.min()
+    maxv = arr.max()
+    #print('minv=', minv, 'maxv=', maxv)
+    arr -= minv
+    arr /= (maxv-minv)
+    arr *= levels-1
+    arr.round_()
+    arr /= levels-1
+    arr *= (maxv-minv)
+    arr += minv
+    return arr
+
+
+# Quantize all model parameters.
+def quantize_model(model, levels):
+    with torch.no_grad():
+        for param in model.parameters():
+            linear_quantize(param, levels)
+
+
+def get_iterator_sz(x):
+    sz = 0
+    for i in x:
+        sz += 1
+    return sz
+
+
+# Replace one bert layer with another.
+def replace_bert_layer(model, replace_layer_from, replace_layer_to):
+    bert_encoder = (model.bert.encoder
+        if isinstance(model, BertForQuestionAnswering)
+        else model.distilbert.transformer)
+    print('Encoder has %d layers %d parameters' % (
+        len(bert_encoder.layer), get_iterator_sz(model.parameters())))
+    bert_encoder.layer[replace_layer_to] = bert_encoder.layer[replace_layer_from]
+    print('After replacement, encoder has %d layers %d parameters' % (
+        len(bert_encoder.layer), get_iterator_sz(model.parameters())))
+
+
+# Replace consecutive bert layers by the same layer.
+def replace_alternate_bert_layers(model, direction):
+    if direction not in ['up', 'down']:
+        raise ValueError('Invalid direction for replace_alternate_bert_layers')
+    bert_encoder = (model.bert.encoder
+        if isinstance(model, BertForQuestionAnswering)
+        else model.distilbert.transformer)
+    print('Encoder has %d layers %d parameters' % (
+        len(bert_encoder.layer), get_iterator_sz(model.parameters())))
+    for i in range(1, len(bert_encoder.layer), 2):
+        if direction == 'down':
+            bert_encoder.layer[i-1] = bert_encoder.layer[i]
+        else:
+            bert_encoder.layer[i] = bert_encoder.layer[i-1]
+    print('After replacement, encoder has %d layers %d parameters' % (
+        len(bert_encoder.layer), get_iterator_sz(model.parameters())))
+
+# Cast all nn.Linear layers to the specified type, and then back to original
+def cast_all_module_linear(model, typeclass):
+    for child_name, child in model.named_children():
+        if isinstance(child, torch.nn.Linear):
+            # Use this to replace the entire module
+            #setattr(model, child_name, nn.Softplus())
+            orig_type = child.weight.data.dtype
+            # Convert to float16 and then back
+            child.weight.data = child.weight.data.type(typeclass).type(orig_type)
+            child.bias.data = child.bias.data.type(typeclass).type(orig_type)
+        else:
+            cast_all_module_linear(child, typeclass)
+
+
 def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False):
     if args.local_rank not in [-1, 0] and not evaluate:
         # Make sure only the first process in distributed training process the dataset, and the others will use the cache
@@ -536,6 +642,29 @@ def main(argv=None):
         type=str,
         required=True,
         help="The output directory where the model checkpoints and predictions will be written.",
+    )
+
+    # Distillation parameters (optional)
+    parser.add_argument(
+        "--teacher_type",
+        default=None,
+        type=str,
+        help="Teacher type. Teacher tokenizer and student (model) tokenizer must output the same tokenization. Only for distillation.",
+    )
+    parser.add_argument(
+        "--teacher_name_or_path",
+        default=None,
+        type=str,
+        help="Path to the already SQuAD fine-tuned teacher model. Only for distillation.",
+    )
+    parser.add_argument(
+        "--alpha_ce", default=0.5, type=float, help="Distillation loss linear weight. Only for distillation."
+    )
+    parser.add_argument(
+        "--alpha_squad", default=0.5, type=float, help="True SQuAD loss linear weight. Only for distillation."
+    )
+    parser.add_argument(
+        "--temperature", default=2.0, type=float, help="Distillation temperature. Only for distillation."
     )
 
     # Other parameters
@@ -700,6 +829,14 @@ def main(argv=None):
     parser.add_argument("--server_port", type=str, default="", help="Can be used for distant debugging.")
 
     parser.add_argument("--threads", type=int, default=1, help="multiple threads for converting example to features")
+    parser.add_argument("--logging_filename", type=str, default=None, help="filename for logging")
+    parser.add_argument("--cast_model_type", type=str, default="", help="cast all weights in the model to this type")
+    parser.add_argument("--quantize_levels", type=int, default=0, help="quantize model params to this many levels")
+    parser.add_argument("--quantize_after_every_batch_in_training", action="store_true", help="quantize model after every batch in training")
+    parser.add_argument("--replace_layer_from", type=int, default=-1, help="replace BERT layer from")
+    parser.add_argument("--replace_layer_to", type=int, default=-1, help="replace BERT layer to")
+    parser.add_argument("--replace_alternate_layers", type=str, default="", help="replace alternate BERT layers (up or down)")
+    parser.add_argument("--vocab_override", type=str, default="", help="override vocab.txt with this file")
     args = parser.parse_args(argv)
 
     if args.doc_stride >= args.max_seq_length - args.max_query_length:
@@ -743,6 +880,7 @@ def main(argv=None):
 
     # Setup logging
     logging.basicConfig(
+        filename=args.logging_filename,
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN,
@@ -770,17 +908,45 @@ def main(argv=None):
         args.config_name if args.config_name else args.model_name_or_path,
         cache_dir=args.cache_dir if args.cache_dir else None,
     )
-    tokenizer = tokenizer_class.from_pretrained(
-        args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
-        do_lower_case=args.do_lower_case,
-        cache_dir=args.cache_dir if args.cache_dir else None,
-    )
+    if args.vocab_override:
+        tokenizer = tokenizer_class(
+            args.vocab_override,
+            do_lower_case=args.do_lower_case,
+            cache_dir=args.cache_dir if args.cache_dir else None,
+        )
+    else:
+        tokenizer = tokenizer_class.from_pretrained(
+            args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
+            do_lower_case=args.do_lower_case,
+            cache_dir=args.cache_dir if args.cache_dir else None,
+        )
     model = model_class.from_pretrained(
         args.model_name_or_path,
         from_tf=bool(".ckpt" in args.model_name_or_path),
         config=config,
         cache_dir=args.cache_dir if args.cache_dir else None,
     )
+    if args.replace_layer_from != -1:
+        replace_bert_layer(model, args.replace_layer_from, args.replace_layer_to)
+    if args.replace_alternate_layers:
+        replace_alternate_bert_layers(model, args.replace_alternate_layers)
+
+
+    if args.teacher_type is not None:
+        assert args.teacher_name_or_path is not None
+        assert args.alpha_ce > 0.0
+        assert args.alpha_ce + args.alpha_squad > 0.0
+        assert args.teacher_type != "distilbert", "We constraint teachers not to be of type DistilBERT."
+        teacher_config_class, teacher_model_class, _ = MODEL_CLASSES[args.teacher_type]
+        teacher_config = teacher_config_class.from_pretrained(
+            args.teacher_name_or_path, cache_dir=args.cache_dir if args.cache_dir else None
+        )
+        teacher = teacher_model_class.from_pretrained(
+            args.teacher_name_or_path, config=teacher_config, cache_dir=args.cache_dir if args.cache_dir else None
+        )
+        teacher.to(args.device)
+    else:
+        teacher = None
 
     if args.local_rank == 0:
         # Make sure only the first process in distributed training will download model & vocab
@@ -804,7 +970,7 @@ def main(argv=None):
     # Training
     if args.do_train:
         train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False)
-        global_step, tr_loss = train(args, train_dataset, model, tokenizer)
+        global_step, tr_loss = train(args, train_dataset, model, tokenizer, teacher)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
     # Save the trained model and the tokenizer
@@ -851,6 +1017,21 @@ def main(argv=None):
             # Reload the model
             global_step = checkpoint.split("-")[-1] if len(checkpoints) > 1 else ""
             model = model_class.from_pretrained(checkpoint)  # , force_download=True)
+
+            if args.cast_model_type:
+                typeclass = getattr(torch, args.cast_model_type)
+                logger.info("Casting model to %s", typeclass)
+                cast_all_module_linear(model, typeclass)
+
+            if args.quantize_levels:
+                logger.info("Quantizing model to %s levels", args.quantize_levels)
+                quantize_model(model, args.quantize_levels)
+
+            if args.replace_layer_from != -1:
+                replace_bert_layer(model, args.replace_layer_from, args.replace_layer_to)
+            if args.replace_alternate_layers:
+                replace_alternate_bert_layers(model, args.replace_alternate_layers)
+
             model.to(args.device)
 
             # Evaluate
