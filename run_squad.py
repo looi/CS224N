@@ -496,6 +496,32 @@ def quantize_model(model, levels):
             linear_quantize(param, levels)
 
 
+# Quantization-aware linear layer inspired by Q8BERT.
+class QuantizationAwareLinear(nn.Module):
+    def __init__(self, linear, levels):
+        super(QuantizationAwareLinear, self).__init__()
+        self.linear = linear
+        self.levels = levels
+
+    def forward(self, x):
+        # Forward pass is quantized.
+        # Backward pass is not (because quantization is not differentiable).
+        result = self.linear(x)
+        with torch.no_grad():
+            linear_quantize(result, self.levels)
+        return result
+
+
+# Cast all nn.Linear layers to QuantizationAwareLinear
+def force_quantization_aware_linear(model, levels):
+    for child_name, child in model.named_children():
+        if isinstance(child, nn.Linear):
+            qal = QuantizationAwareLinear(child, levels)
+            setattr(model, child_name, qal)
+        else:
+            force_quantization_aware_linear(child, levels)
+
+
 def get_iterator_sz(x):
     sz = 0
     for i in x:
@@ -515,22 +541,41 @@ def replace_bert_layer(model, replace_layer_from, replace_layer_to):
         len(bert_encoder.layer), get_iterator_sz(model.parameters())))
 
 
+def get_num_params(model):
+    return sum(p.numel() for p in model.parameters())
+
+
+def get_num_trainable_params(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
 # Replace consecutive bert layers by the same layer.
-def replace_alternate_bert_layers(model, direction):
+def replace_alternate_bert_layers(model, config, direction, group_size, do_delete):
     if direction not in ['up', 'down']:
         raise ValueError('Invalid direction for replace_alternate_bert_layers')
     bert_encoder = (model.bert.encoder
         if isinstance(model, BertForQuestionAnswering)
         else model.distilbert.transformer)
-    print('Encoder has %d layers %d parameters' % (
-        len(bert_encoder.layer), get_iterator_sz(model.parameters())))
-    for i in range(1, len(bert_encoder.layer), 2):
-        if direction == 'down':
-            bert_encoder.layer[i-1] = bert_encoder.layer[i]
+    print('Encoder has %d layers %d param objs %d params %d trainable params' % (
+        len(bert_encoder.layer), get_iterator_sz(model.parameters()),
+        get_num_params(model), get_num_trainable_params(model)))
+    new_modules = []
+    for i in range(0, len(bert_encoder.layer), group_size):
+        egroup = min(i+group_size, len(bert_encoder.layer))
+        src = i if direction == 'up' else (egroup-1)
+        if do_delete:
+            new_modules.append(bert_encoder.layer[src])
         else:
-            bert_encoder.layer[i] = bert_encoder.layer[i-1]
-    print('After replacement, encoder has %d layers %d parameters' % (
-        len(bert_encoder.layer), get_iterator_sz(model.parameters())))
+            for j in range(i, egroup):
+                if j == src: continue
+                bert_encoder.layer[j] = bert_encoder.layer[src]
+    if do_delete:
+        bert_encoder.layer = nn.ModuleList(new_modules)
+    print('After replacement, encoder has %d layers %d param objs %d params %d trainable params' % (
+        len(bert_encoder.layer), get_iterator_sz(model.parameters()),
+        get_num_params(model), get_num_trainable_params(model)))
+    config.num_hidden_layers = len(bert_encoder.layer)
+    print(config)
 
 # Cast all nn.Linear layers to the specified type, and then back to original
 def cast_all_module_linear(model, typeclass):
@@ -617,8 +662,6 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
 
 
 def main(argv=None):
-    print(argv)
-    assert False
     parser = argparse.ArgumentParser()
 
     # Required parameters
@@ -833,9 +876,12 @@ def main(argv=None):
     parser.add_argument("--cast_model_type", type=str, default="", help="cast all weights in the model to this type")
     parser.add_argument("--quantize_levels", type=int, default=0, help="quantize model params to this many levels")
     parser.add_argument("--quantize_after_every_batch_in_training", action="store_true", help="quantize model after every batch in training")
+    parser.add_argument("--force_quantization_aware_linear", action="store_true", help="use quantization aware linear layer")
     parser.add_argument("--replace_layer_from", type=int, default=-1, help="replace BERT layer from")
     parser.add_argument("--replace_layer_to", type=int, default=-1, help="replace BERT layer to")
     parser.add_argument("--replace_alternate_layers", type=str, default="", help="replace alternate BERT layers (up or down)")
+    parser.add_argument("--replace_alternate_layers_group_size", type=int, default=2, help="group size for replace alternate BERT layers")
+    parser.add_argument("--delete_instead_of_replace_layers", action="store_true", help="delete layers instead of replacing")
     parser.add_argument("--vocab_override", type=str, default="", help="override vocab.txt with this file")
     args = parser.parse_args(argv)
 
@@ -929,7 +975,11 @@ def main(argv=None):
     if args.replace_layer_from != -1:
         replace_bert_layer(model, args.replace_layer_from, args.replace_layer_to)
     if args.replace_alternate_layers:
-        replace_alternate_bert_layers(model, args.replace_alternate_layers)
+        replace_alternate_bert_layers(model, config, args.replace_alternate_layers,
+            args.replace_alternate_layers_group_size, args.delete_instead_of_replace_layers)
+    if args.quantize_levels and args.force_quantization_aware_linear:
+        logger.info("Using quantization aware Linear with %s levels", args.quantize_levels)
+        force_quantization_aware_linear(model, args.quantize_levels)
 
 
     if args.teacher_type is not None:
@@ -1023,14 +1073,18 @@ def main(argv=None):
                 logger.info("Casting model to %s", typeclass)
                 cast_all_module_linear(model, typeclass)
 
-            if args.quantize_levels:
-                logger.info("Quantizing model to %s levels", args.quantize_levels)
-                quantize_model(model, args.quantize_levels)
-
             if args.replace_layer_from != -1:
                 replace_bert_layer(model, args.replace_layer_from, args.replace_layer_to)
             if args.replace_alternate_layers:
-                replace_alternate_bert_layers(model, args.replace_alternate_layers)
+                replace_alternate_bert_layers(model, config, args.replace_alternate_layers,
+                    args.replace_alternate_layers_group_size, args.delete_instead_of_replace_layers)
+            if args.quantize_levels:
+                if args.force_quantization_aware_linear:
+                    logger.info("Using quantization aware Linear with %s levels", args.quantize_levels)
+                    force_quantization_aware_linear(model, args.quantize_levels)
+                else:
+                    logger.info("Quantizing model to %s levels", args.quantize_levels)
+                    quantize_model(model, args.quantize_levels)
 
             model.to(args.device)
 
